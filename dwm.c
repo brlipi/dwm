@@ -29,6 +29,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/types.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <X11/cursorfont.h>
 #include <X11/keysym.h>
@@ -36,10 +37,13 @@
 #include <X11/Xlib.h>
 #include <X11/Xproto.h>
 #include <X11/Xutil.h>
+#include <X11/Xresource.h>
 #ifdef XINERAMA
 #include <X11/extensions/Xinerama.h>
 #endif /* XINERAMA */
 #include <X11/Xft/Xft.h>
+#include <X11/Xlib-xcb.h>
+#include <xcb/res.h>
 
 #include "drw.h"
 #include "util.h"
@@ -92,9 +96,11 @@ struct Client {
 	int basew, baseh, incw, inch, maxw, maxh, minw, minh;
 	int bw, oldbw;
 	unsigned int tags;
-	int isfixed, isfloating, isurgent, neverfocus, oldstate, isfullscreen;
+	int isfixed, isfloating, isurgent, neverfocus, oldstate, isfullscreen, isterminal, noswallow;
+	pid_t pid;
 	Client *next;
 	Client *snext;
+	Client *swallowing;
 	Monitor *mon;
 	Window win;
 };
@@ -119,6 +125,7 @@ struct Monitor {
 	int by;               /* bar geometry */
 	int mx, my, mw, mh;   /* screen size */
 	int wx, wy, ww, wh;   /* window area  */
+	int gappx;            /* gaps between windows */
 	unsigned int seltags;
 	unsigned int sellt;
 	unsigned int tagset[2];
@@ -138,8 +145,23 @@ typedef struct {
 	const char *title;
 	unsigned int tags;
 	int isfloating;
+	int isterminal;
+	int noswallow;
 	int monitor;
 } Rule;
+
+/* Xresources preferences */
+enum resource_type {
+	STRING = 0,
+	INTEGER = 1,
+	FLOAT = 2
+};
+
+typedef struct {
+	char *name;
+	enum resource_type type;
+	void *dst;
+} ResourcePref;
 
 /* function declarations */
 static void applyrules(Client *c);
@@ -156,6 +178,7 @@ static void clientmessage(XEvent *e);
 static void configure(Client *c);
 static void configurenotify(XEvent *e);
 static void configurerequest(XEvent *e);
+static void copyvalidchars(char *text, char *rawtext);
 static Monitor *createmon(void);
 static void destroynotify(XEvent *e);
 static void detach(Client *c);
@@ -170,6 +193,7 @@ static void focusin(XEvent *e);
 static void focusmon(const Arg *arg);
 static void focusstack(const Arg *arg);
 static Atom getatomprop(Client *c, Atom prop);
+static int getdwmblockspid();
 static int getrootptr(int *x, int *y);
 static long getstate(Window w);
 static int gettextprop(Window w, Atom atom, char *text, unsigned int size);
@@ -194,18 +218,21 @@ static void resizeclient(Client *c, int x, int y, int w, int h);
 static void resizemouse(const Arg *arg);
 static void restack(Monitor *m);
 static void run(void);
+static void runautostart(void);
 static void scan(void);
 static int sendevent(Client *c, Atom proto);
 static void sendmon(Client *c, Monitor *m);
 static void setclientstate(Client *c, long state);
 static void setfocus(Client *c);
 static void setfullscreen(Client *c, int fullscreen);
+static void setgaps(const Arg *arg);
 static void setlayout(const Arg *arg);
 static void setmfact(const Arg *arg);
 static void setup(void);
 static void seturgent(Client *c, int urg);
 static void showhide(Client *c);
 static void sigchld(int unused);
+static void sigdwmblocks(const Arg *arg);
 static void spawn(const Arg *arg);
 static void tag(const Arg *arg);
 static void tagmon(const Arg *arg);
@@ -234,10 +261,25 @@ static int xerror(Display *dpy, XErrorEvent *ee);
 static int xerrordummy(Display *dpy, XErrorEvent *ee);
 static int xerrorstart(Display *dpy, XErrorEvent *ee);
 static void zoom(const Arg *arg);
+static void load_xresources(void);
+static void resource_load(XrmDatabase db, char *name, enum resource_type rtype, void *dst);
+
+static pid_t getparentprocess(pid_t p);
+static int isdescprocess(pid_t p, pid_t c);
+static Client *swallowingclient(Window w);
+static Client *termforwin(const Client *c);
+static pid_t winpid(Window w);
 
 /* variables */
+static const char autostartblocksh[] = "autostart_blocking.sh";
+static const char autostartsh[] = "autostart.sh";
 static const char broken[] = "broken";
+static const char dwmdir[] = "dwm";
+static const char localshare[] = ".local/share";
 static char stext[256];
+static char rawstext[256];
+static int dwmblockssig;
+pid_t dwmblockspid = 0;
 static int screen;
 static int sw, sh;           /* X display screen geometry width, height */
 static int bh, blw = 0;      /* bar geometry */
@@ -269,6 +311,8 @@ static Drw *drw;
 static Monitor *mons, *selmon;
 static Window root, wmcheckwin;
 
+static xcb_connection_t *xcon;
+
 /* configuration, allows nested code to access above variables */
 #include "config.h"
 
@@ -298,6 +342,8 @@ applyrules(Client *c)
 		&& (!r->class || strstr(class, r->class))
 		&& (!r->instance || strstr(instance, r->instance)))
 		{
+			c->isterminal = r->isterminal;
+			c->noswallow  = r->noswallow;
 			c->isfloating = r->isfloating;
 			c->tags |= r->tags;
 			for (m = mons; m && m->num != r->monitor; m = m->next);
@@ -415,6 +461,53 @@ attachstack(Client *c)
 }
 
 void
+swallow(Client *p, Client *c)
+{
+
+	if (c->noswallow || c->isterminal)
+		return;
+	if (c->noswallow && !swallowfloating && c->isfloating)
+		return;
+
+	detach(c);
+	detachstack(c);
+
+	setclientstate(c, WithdrawnState);
+	XUnmapWindow(dpy, p->win);
+
+	p->swallowing = c;
+	c->mon = p->mon;
+
+	Window w = p->win;
+	p->win = c->win;
+	c->win = w;
+	updatetitle(p);
+	XMoveResizeWindow(dpy, p->win, p->x, p->y, p->w, p->h);
+	arrange(p->mon);
+	configure(p);
+	updateclientlist();
+}
+
+void
+unswallow(Client *c)
+{
+	c->win = c->swallowing->win;
+
+	free(c->swallowing);
+	c->swallowing = NULL;
+
+	/* unfullscreen the client */
+	setfullscreen(c, 0);
+	updatetitle(c);
+	arrange(c->mon);
+	XMapWindow(dpy, c->win);
+	XMoveResizeWindow(dpy, c->win, c->x, c->y, c->w, c->h);
+	setclientstate(c, NormalState);
+	focus(NULL);
+	arrange(c->mon);
+}
+
+void
 buttonpress(XEvent *e)
 {
 	unsigned int i, x, click;
@@ -440,9 +533,26 @@ buttonpress(XEvent *e)
 			arg.ui = 1 << i;
 		} else if (ev->x < x + blw)
 			click = ClkLtSymbol;
-		else if (ev->x > selmon->ww - TEXTW(stext))
+		else if (ev->x > (x = selmon->ww - TEXTW(stext) + lrpad)) {
 			click = ClkStatusText;
-		else
+
+			char *text = rawstext;
+			int i = -1;
+			char ch;
+			dwmblockssig = 0;
+			while (text[++i]) {
+				if ((unsigned char)text[i] < ' ') {
+					ch = text[i];
+					text[i] = '\0';
+					x += TEXTW(text) - lrpad;
+					text[i] = ch;
+					text += i+1;
+					i = -1;
+					if (x >= ev->x) break;
+					dwmblockssig = ch;
+				}
+			}
+		} else
 			click = ClkWinTitle;
 	} else if ((c = wintoclient(ev->window))) {
 		focus(c);
@@ -628,6 +738,19 @@ configurerequest(XEvent *e)
 	XSync(dpy, False);
 }
 
+void
+copyvalidchars(char *text, char *rawtext)
+{
+	int i = -1, j = 0;
+
+	while(rawtext[++i]) {
+		if ((unsigned char)rawtext[i] >= ' ') {
+			text[j++] = rawtext[i];
+		}
+	}
+	text[j] = '\0';
+}
+
 Monitor *
 createmon(void)
 {
@@ -639,6 +762,7 @@ createmon(void)
 	m->nmaster = nmaster;
 	m->showbar = showbar;
 	m->topbar = topbar;
+	m->gappx = gappx;
 	m->lt[0] = &layouts[0];
 	m->lt[1] = &layouts[1 % LENGTH(layouts)];
 	strncpy(m->ltsymbol, layouts[0].symbol, sizeof m->ltsymbol);
@@ -653,6 +777,9 @@ destroynotify(XEvent *e)
 
 	if ((c = wintoclient(ev->window)))
 		unmanage(c, 1);
+
+	else if ((c = swallowingclient(ev->window)))
+		unmanage(c->swallowing, 1);
 }
 
 void
@@ -873,6 +1000,18 @@ getatomprop(Client *c, Atom prop)
 }
 
 int
+getdwmblockspid()
+{
+	char buf[16];
+	FILE *fp = popen("pidof -s dwmblocks", "r");
+	fgets(buf, sizeof(buf), fp);
+	pid_t pid = strtoul(buf, NULL, 10);
+	pclose(fp);
+	dwmblockspid = pid;
+	return pid != 0 ? 0 : -1;
+}
+
+int
 getrootptr(int *x, int *y)
 {
 	int di;
@@ -1018,12 +1157,13 @@ killclient(const Arg *arg)
 void
 manage(Window w, XWindowAttributes *wa)
 {
-	Client *c, *t = NULL;
+	Client *c, *t = NULL, *term = NULL;
 	Window trans = None;
 	XWindowChanges wc;
 
 	c = ecalloc(1, sizeof(Client));
 	c->win = w;
+	c->pid = winpid(w);
 	/* geometry */
 	c->x = c->oldx = wa->x;
 	c->y = c->oldy = wa->y;
@@ -1038,6 +1178,7 @@ manage(Window w, XWindowAttributes *wa)
 	} else {
 		c->mon = selmon;
 		applyrules(c);
+		term = termforwin(c);
 	}
 
 	if (c->x + WIDTH(c) > c->mon->mx + c->mon->mw)
@@ -1074,6 +1215,8 @@ manage(Window w, XWindowAttributes *wa)
 	c->mon->sel = c;
 	arrange(c->mon);
 	XMapWindow(dpy, c->win);
+	if (term)
+		swallow(term, c);
 	focus(NULL);
 }
 
@@ -1382,6 +1525,89 @@ run(void)
 }
 
 void
+runAutostart(void) {
+	system("cd ~/.dwm; ./autostart_blocking.sh");
+	system("cd ~/.dwm; ./autostart.sh &");
+}
+
+void
+runautostart(void)
+{
+	char *pathpfx;
+	char *path;
+	char *xdgdatahome;
+	char *home;
+	struct stat sb;
+
+	if ((home = getenv("HOME")) == NULL)
+		/* this is almost impossible */
+		return;
+
+	/* if $XDG_DATA_HOME is set and not empty, use $XDG_DATA_HOME/dwm,
+	 * otherwise use ~/.local/share/dwm as autostart script directory
+	 */
+	xdgdatahome = getenv("XDG_DATA_HOME");
+	if (xdgdatahome != NULL && *xdgdatahome != '\0') {
+		/* space for path segments, separators and nul */
+		pathpfx = ecalloc(1, strlen(xdgdatahome) + strlen(dwmdir) + 2);
+
+		if (sprintf(pathpfx, "%s/%s", xdgdatahome, dwmdir) <= 0) {
+			free(pathpfx);
+			return;
+		}
+	} else {
+		/* space for path segments, separators and nul */
+		pathpfx = ecalloc(1, strlen(home) + strlen(localshare)
+		                     + strlen(dwmdir) + 3);
+
+		if (sprintf(pathpfx, "%s/%s/%s", home, localshare, dwmdir) < 0) {
+			free(pathpfx);
+			return;
+		}
+	}
+
+	/* check if the autostart script directory exists */
+	if (! (stat(pathpfx, &sb) == 0 && S_ISDIR(sb.st_mode))) {
+		/* the XDG conformant path does not exist or is no directory
+		 * so we try ~/.dwm instead
+		 */
+		char *pathpfx_new = realloc(pathpfx, strlen(home) + strlen(dwmdir) + 3);
+		if(pathpfx_new == NULL) {
+			free(pathpfx);
+			return;
+		}
+   pathpfx = pathpfx_new;
+
+		if (sprintf(pathpfx, "%s/.%s", home, dwmdir) <= 0) {
+			free(pathpfx);
+			return;
+		}
+	}
+
+	/* try the blocking script first */
+	path = ecalloc(1, strlen(pathpfx) + strlen(autostartblocksh) + 2);
+	if (sprintf(path, "%s/%s", pathpfx, autostartblocksh) <= 0) {
+		free(path);
+		free(pathpfx);
+	}
+
+	if (access(path, X_OK) == 0)
+		system(path);
+
+	/* now the non-blocking script */
+	if (sprintf(path, "%s/%s", pathpfx, autostartsh) <= 0) {
+		free(path);
+		free(pathpfx);
+	}
+
+	if (access(path, X_OK) == 0)
+		system(strcat(path, " &"));
+
+	free(pathpfx);
+	free(path);
+}
+
+void
 scan(void)
 {
 	unsigned int i, num;
@@ -1496,6 +1722,16 @@ setfullscreen(Client *c, int fullscreen)
 		resizeclient(c, c->x, c->y, c->w, c->h);
 		arrange(c->mon);
 	}
+}
+
+void
+setgaps(const Arg *arg)
+{
+	if ((arg->i == 0) || (selmon->gappx + arg->i < 0))
+		selmon->gappx = 0;
+	else
+		selmon->gappx += arg->i;
+	arrange(selmon);
 }
 
 void
@@ -1638,6 +1874,23 @@ sigchld(int unused)
 }
 
 void
+sigdwmblocks(const Arg *arg)
+{
+	union sigval sv;
+	sv.sival_int = (dwmblockssig << 8) | arg->i;
+	if (!dwmblockspid)
+		if (getdwmblockspid() == -1)
+			return;
+
+	if (sigqueue(dwmblockspid, SIGUSR1, sv) == -1) {
+		if (errno == ESRCH) {
+			if (!getdwmblockspid())
+				sigqueue(dwmblockspid, SIGUSR1, sv);
+		}
+	}
+}
+
+void
 spawn(const Arg *arg)
 {
 	if (arg->v == dmenucmd)
@@ -1684,18 +1937,18 @@ tile(Monitor *m)
 	if (n > m->nmaster)
 		mw = m->nmaster ? m->ww * m->mfact : 0;
 	else
-		mw = m->ww;
-	for (i = my = ty = 0, c = nexttiled(m->clients); c; c = nexttiled(c->next), i++)
+		mw = m->ww - m->gappx;
+	for (i = 0, my = ty = m->gappx, c = nexttiled(m->clients); c; c = nexttiled(c->next), i++)
 		if (i < m->nmaster) {
-			h = (m->wh - my) / (MIN(n, m->nmaster) - i);
-			resize(c, m->wx, m->wy + my, mw - (2*c->bw), h - (2*c->bw), 0);
-			if (my + HEIGHT(c) < m->wh)
-				my += HEIGHT(c);
+			h = (m->wh - my) / (MIN(n, m->nmaster) - i) - m->gappx;
+			resize(c, m->wx + m->gappx, m->wy + my, mw - (2*c->bw) - m->gappx, h - (2*c->bw), 0);
+			if (my + HEIGHT(c) + m->gappx < m->wh)
+				my += HEIGHT(c) + m->gappx;
 		} else {
-			h = (m->wh - ty) / (n - i);
-			resize(c, m->wx + mw, m->wy + ty, m->ww - mw - (2*c->bw), h - (2*c->bw), 0);
-			if (ty + HEIGHT(c) < m->wh)
-				ty += HEIGHT(c);
+			h = (m->wh - ty) / (n - i) - m->gappx;
+			resize(c, m->wx + mw + m->gappx, m->wy + ty, m->ww - mw - (2*c->bw) - 2*m->gappx, h - (2*c->bw), 0);
+			if (ty + HEIGHT(c) + m->gappx < m->wh)
+				ty += HEIGHT(c) + m->gappx;
 		}
 }
 
@@ -1768,6 +2021,20 @@ unmanage(Client *c, int destroyed)
 	Monitor *m = c->mon;
 	XWindowChanges wc;
 
+	if (c->swallowing) {
+		unswallow(c);
+		return;
+	}
+
+	Client *s = swallowingclient(c->win);
+	if (s) {
+		free(s->swallowing);
+		s->swallowing = NULL;
+		arrange(m);
+		focus(NULL);
+		return;
+	}
+
 	detach(c);
 	detachstack(c);
 	if (!destroyed) {
@@ -1782,9 +2049,12 @@ unmanage(Client *c, int destroyed)
 		XUngrabServer(dpy);
 	}
 	free(c);
-	focus(NULL);
-	updateclientlist();
-	arrange(m);
+
+	if (!s) {
+		arrange(m);
+		focus(NULL);
+		updateclientlist();
+	}
 }
 
 void
@@ -1990,8 +2260,10 @@ updatesizehints(Client *c)
 void
 updatestatus(void)
 {
-	if (!gettextprop(root, XA_WM_NAME, stext, sizeof(stext)))
+	if (!gettextprop(root, XA_WM_NAME, rawstext, sizeof(rawstext)))
 		strcpy(stext, "dwm-"VERSION);
+	else
+		copyvalidchars(stext, rawstext);
 	drawbar(selmon);
 }
 
@@ -2045,6 +2317,103 @@ view(const Arg *arg)
 		selmon->tagset[selmon->seltags] = arg->ui & TAGMASK;
 	focus(NULL);
 	arrange(selmon);
+}
+
+pid_t
+winpid(Window w)
+{
+	pid_t result = 0;
+
+	xcb_res_client_id_spec_t spec = {0};
+	spec.client = w;
+	spec.mask = XCB_RES_CLIENT_ID_MASK_LOCAL_CLIENT_PID;
+
+	xcb_generic_error_t *e = NULL;
+	xcb_res_query_client_ids_cookie_t c = xcb_res_query_client_ids(xcon, 1, &spec);
+	xcb_res_query_client_ids_reply_t *r = xcb_res_query_client_ids_reply(xcon, c, &e);
+
+	if (!r)
+		return (pid_t)0;
+
+	xcb_res_client_id_value_iterator_t i = xcb_res_query_client_ids_ids_iterator(r);
+	for (; i.rem; xcb_res_client_id_value_next(&i)) {
+		spec = i.data->spec;
+		if (spec.mask & XCB_RES_CLIENT_ID_MASK_LOCAL_CLIENT_PID) {
+			uint32_t *t = xcb_res_client_id_value_value(i.data);
+			result = *t;
+			break;
+		}
+	}
+
+	free(r);
+
+	if (result == (pid_t)-1)
+		result = 0;
+	return result;
+}
+
+pid_t
+getparentprocess(pid_t p)
+{
+	unsigned int v = 0;
+
+#ifdef __linux__
+	FILE *f;
+	char buf[256];
+	snprintf(buf, sizeof(buf) - 1, "/proc/%u/stat", (unsigned)p);
+
+	if (!(f = fopen(buf, "r")))
+		return 0;
+
+	fscanf(f, "%*u %*s %*c %u", &v);
+	fclose(f);
+#endif /* __linux__*/
+
+	return (pid_t)v;
+}
+
+int
+isdescprocess(pid_t p, pid_t c)
+{
+	while (p != c && c != 0)
+		c = getparentprocess(c);
+
+	return (int)c;
+}
+
+Client *
+termforwin(const Client *w)
+{
+	Client *c;
+	Monitor *m;
+
+	if (!w->pid || w->isterminal)
+		return NULL;
+
+	for (m = mons; m; m = m->next) {
+		for (c = m->clients; c; c = c->next) {
+			if (c->isterminal && !c->swallowing && c->pid && isdescprocess(c->pid, w->pid))
+				return c;
+		}
+	}
+
+	return NULL;
+}
+
+Client *
+swallowingclient(Window w)
+{
+	Client *c;
+	Monitor *m;
+
+	for (m = mons; m; m = m->next) {
+		for (c = m->clients; c; c = c->next) {
+			if (c->swallowing && c->swallowing->win == w)
+				return c;
+		}
+	}
+
+	return NULL;
 }
 
 Client *
@@ -2127,6 +2496,60 @@ zoom(const Arg *arg)
 	pop(c);
 }
 
+void
+resource_load(XrmDatabase db, char *name, enum resource_type rtype, void *dst)
+{
+	char *sdst = NULL;
+	int *idst = NULL;
+	float *fdst = NULL;
+
+	sdst = dst;
+	idst = dst;
+	fdst = dst;
+
+	char fullname[256];
+	char *type;
+	XrmValue ret;
+
+	snprintf(fullname, sizeof(fullname), "%s.%s", "dwm", name);
+	fullname[sizeof(fullname) - 1] = '\0';
+
+	XrmGetResource(db, fullname, "*", &type, &ret);
+	if (!(ret.addr == NULL || strncmp("String", type, 64)))
+	{
+		switch (rtype) {
+		case STRING:
+			strcpy(sdst, ret.addr);
+			break;
+		case INTEGER:
+			*idst = strtoul(ret.addr, NULL, 10);
+			break;
+		case FLOAT:
+			*fdst = strtof(ret.addr, NULL);
+			break;
+		}
+	}
+}
+
+void
+load_xresources(void)
+{
+	Display *display;
+	char *resm;
+	XrmDatabase db;
+	ResourcePref *p;
+
+	display = XOpenDisplay(NULL);
+	resm = XResourceManagerString(display);
+	if (!resm)
+		return;
+
+	db = XrmGetStringDatabase(resm);
+	for (p = resources; p < resources + LENGTH(resources); p++)
+		resource_load(db, p->name, p->type, p->dst);
+	XCloseDisplay(display);
+}
+
 int
 main(int argc, char *argv[])
 {
@@ -2138,13 +2561,18 @@ main(int argc, char *argv[])
 		fputs("warning: no locale support\n", stderr);
 	if (!(dpy = XOpenDisplay(NULL)))
 		die("dwm: cannot open display");
+	if (!(xcon = XGetXCBConnection(dpy)))
+		die("dwm: cannot get xcb connection\n");
 	checkotherwm();
+	XrmInitialize();
+	load_xresources();
 	setup();
 #ifdef __OpenBSD__
 	if (pledge("stdio rpath proc exec", NULL) == -1)
 		die("pledge");
 #endif /* __OpenBSD__ */
 	scan();
+	runautostart();
 	run();
 	cleanup();
 	XCloseDisplay(dpy);
