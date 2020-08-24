@@ -1,7 +1,7 @@
 # Personal fork of dwm (Dynamic window manager for X)
-[dwm's official webpage](dwm.suckless.org) Original source code at: git.suckless.org/dwm/.
+[dwm's official webpage](dwm.suckless.org) Original source code at: [git.suckless.org/dwm/](git.suckless.org/dwm/).
 
-## Patches Applied
+## Patches applied
 If not declared otherwise, assume most recent version for all mentioned patches.
 - [Fullgaps](https://dwm.suckless.org/patches/fullgaps/): This patch adds gaps between client windows. It is similar to gaps, but contains additional functionality.
 - [Shiftview](https://lists.suckless.org/dev/att-7590/shiftview.c): A better implementation of the [nextprev](https://dwm.suckless.org/patches/nextprev/) patch. See [discussion](https://lists.suckless.org/dev/1104/7590.html).
@@ -12,8 +12,15 @@ This fork is built using the patch version which conforms to the [XDG Base Direc
 - [Statuscmd](https://dwm.suckless.org/patches/statuscmd/): This patch adds the ability to execute shell commands based on the mouse button and position when clicking the status bar.
 Required for integration with my personal [dwmblocks fork](https://github.com/brlipi/dwmblocks). The [statuscmd-signal](https://dwm.suckless.org/patches/statuscmd/dwm-statuscmd-signal-6.2.diff) diff was patched.
 
-## Installation
-Simply clone this repository in the directory of your choice. Then, if you wish to change its default namespace installation (/usr/local), edit the `config.mk` file. Afterwards run `sudo make clean install`.
-
 ## Emoji support
-WIP
+This fork has two branches, on which `master` is supposed to be used by those with the [xft-bgra fix for libXft](https://gitlab.freedesktop.org/xorg/lib/libxft/-/merge_requests/1/diffs?commit_id=b77e5752cbd4acef90904e00c0f392984c321ca9). If you do not have it, then you will need to use th `no-emoji` branch. After cloning this repository, run: 
+```bash
+  git fetch origin
+  git branch no-emoji no-emoji/origin
+  git checkout no-emoji
+  git pull
+```
+Make sure you're in the correct branch before proceeding with installation.
+
+## Installation
+After cloning this repository in the directory of your choice, then, if you wish to change its default namespace installation (/usr/local), edit the `config.mk` file. Afterwards run `sudo make clean install`.
