@@ -1,5 +1,5 @@
 # Personal fork of dwm (Dynamic window manager for X)
-[dwm's official webpage](dwm.suckless.org) Original source code at: <git.suckless.org/dwm/>.
+[dwm's official webpage](dwm.suckless.org) Original source code at: git.suckless.org/dwm/.
 
 ## Patches Applied
 If not declared otherwise, assume most recent version for all mentioned patches.
