@@ -15,7 +15,7 @@ This fork is built using the patch version which conforms to the [XDG Base Direc
 Required for integration with my personal [dwmblocks fork](https://github.com/brlipi/dwmblocks). The [statuscmd-signal](https://dwm.suckless.org/patches/statuscmd/dwm-statuscmd-signal-6.2.diff) diff was patched.
 
 ## Emoji support
-This fork has two branches, on which `master` is supposed to be used by those with the [xft-bgra fix for libXft](https://gitlab.freedesktop.org/xorg/lib/libxft/-/merge_requests/1/diffs?commit_id=b77e5752cbd4acef90904e00c0f392984c321ca9). If you do not have it, then you will need to use th `no-emoji` branch. After cloning this repository, run: 
+This fork has two branches, on which `master` is supposed to be used by those with the [xft-bgra fix for libXft](https://gitlab.freedesktop.org/xorg/lib/libxft/-/merge_requests/1/diffs?commit_id=b77e5752cbd4acef90904e00c0f392984c321ca9). If you do not have it, then you will need to use the `no-emoji` branch. After cloning this repository, run: 
 ```bash
   git fetch origin
   git branch no-emoji no-emoji/origin
